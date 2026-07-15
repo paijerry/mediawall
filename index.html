@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
 <meta charset="UTF-8">
-<title>media wall</title>
+<title>七格媒體牆</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #111; }
@@ -100,6 +100,10 @@
     let baseTx = 0, baseTy = 0;
     let baseW = 0, baseH = 0;
 
+    // 記錄每個媒體（以來源為鍵）的縮放與位移狀態，輪播回來時還原
+    // 存在 panel 上，混播切換元素時記錄不會消失；拖入新檔案時才清掉
+    const saved = panel._saved || (panel._saved = new Map());
+
     // 限制位移範圍，媒體邊緣不能進到格子內（永遠滿版）
     function clamp() {
       const pw = panel.clientWidth, ph = panel.clientHeight;
@@ -110,6 +114,7 @@
     function apply() {
       clamp();
       media.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      saved.set(media.src, { scale, tx, ty });
     }
 
     // 依原圖比例把元素放大到剛好蓋滿格子並置中（外觀同 cover，但保留完整原圖）
@@ -125,13 +130,20 @@
       media.style.height = baseH + 'px';
       baseTx = (pw - baseW) / 2;
       baseTy = (ph - baseH) / 2;
-      scale = 1; tx = baseTx; ty = baseTy;
+      const s = saved.get(media.src);
+      if (s) {
+        // 這張圖之前調整過 → 還原上次的縮放與位移
+        scale = s.scale; tx = s.tx; ty = s.ty;
+      } else {
+        scale = 1; tx = baseTx; ty = baseTy;
+      }
       apply();
     }
 
     if (media.tagName === 'IMG') {
+      // 不用 once：幻燈片換圖後要重新計算尺寸並重置縮放位置
+      media.addEventListener('load', layout);
       if (media.complete && media.naturalWidth) layout();
-      else media.addEventListener('load', layout, { once: true });
     } else {
       if (media.videoWidth) layout();
       else media.addEventListener('loadedmetadata', layout, { once: true });
@@ -236,6 +248,46 @@
     return box;
   }
 
+  // 建立混合幻燈片控制列：間隔（圖片）＋音量／速度（影片）
+  function buildMixedControls(settings, getVideo, onIntervalChange) {
+    const box = document.createElement('div');
+    box.className = 'controls';
+
+    const mk = (text, min, max, step, value, fmt, oninput) => {
+      const label = document.createElement('label');
+      label.textContent = text;
+      const rng = document.createElement('input');
+      rng.type = 'range';
+      rng.min = min; rng.max = max; rng.step = step; rng.value = value;
+      const val = document.createElement('span');
+      val.className = 'val';
+      val.textContent = fmt(value);
+      rng.addEventListener('input', () => {
+        val.textContent = fmt(rng.value);
+        oninput(parseFloat(rng.value));
+      });
+      label.append(rng, val);
+      box.append(label);
+    };
+
+    mk('間隔', 1, 10, 1, 5, v => v + '秒', v => {
+      settings.interval = v;
+      onIntervalChange();
+    });
+    mk('音量', 0, 100, 1, 0, v => v + '%', v => {
+      settings.volume = v / 100;
+      const vid = getVideo();
+      if (vid) { vid.volume = settings.volume; vid.muted = settings.volume === 0; }
+    });
+    mk('速度', 0.25, 3, 0.05, 1, v => parseFloat(v).toFixed(2) + 'x', v => {
+      settings.rate = v;
+      const vid = getVideo();
+      if (vid) vid.playbackRate = v;
+    });
+
+    return box;
+  }
+
   // 從網址參數讀取分割方式：
   //   v = 縱向切（欄），h = 橫向切（列），可單獨或同時使用
   //   ?v=2-1-1        → 三欄，寬度比例 2:1:1（即 1/2、1/4、1/4）
@@ -275,39 +327,98 @@
       e.preventDefault();
       panel.classList.remove('dragover');
 
-      const file = e.dataTransfer.files[0];
-      if (!file) return;
+      const files = [...e.dataTransfer.files];
+      const mediaFiles = files.filter(f =>
+        f.type.startsWith('image/') || f.type.startsWith('video/'));
+      if (!mediaFiles.length) return;
 
-      const url = URL.createObjectURL(file);
-      let media;
-      let controls = null;
-
-      if (file.type.startsWith('image/')) {
-        media = document.createElement('img');
-        media.src = url;
-      } else if (file.type.startsWith('video/')) {
-        media = document.createElement('video');
-        media.src = url;
-        media.loop = true;      // 循環播放
-        media.muted = true;     // 預設音量 0（靜音才能自動播放）
-        media.volume = 0;
-        media.autoplay = true;
-        media.playsInline = true;
-        media.play();
-        controls = buildControls(media);
-      } else {
-        URL.revokeObjectURL(url);
-        return;
-      }
-
-      // 釋放舊的 object URL，避免記憶體累積
-      const old = panel.querySelector('img, video');
-      if (old && old.src.startsWith('blob:')) URL.revokeObjectURL(old.src);
-
+      // 清掉舊內容：停止計時器、釋放 object URL、清除縮放記錄
+      if (panel._timer) { clearTimeout(panel._timer); panel._timer = null; }
+      (panel._urls || []).forEach(u => URL.revokeObjectURL(u));
+      panel._urls = [];
+      panel._saved = new Map();
       panel.innerHTML = '';
-      panel.appendChild(media);
-      if (controls) panel.appendChild(controls);
-      enableZoomPan(panel, media);
+
+      if (mediaFiles.length > 1) {
+        // 多個檔案 → 圖片影片混合幻燈片
+        // 圖片顯示「間隔」秒數後換下一個；影片播完一輪換下一個
+        const items = mediaFiles.map(f => ({
+          url: URL.createObjectURL(f),
+          isVideo: f.type.startsWith('video/')
+        }));
+        panel._urls = items.map(it => it.url);
+
+        const settings = { interval: 5, volume: 0, rate: 1 };
+        let idx = -1;
+        let current = null;
+
+        function next() { show((idx + 1) % items.length); }
+
+        function show(i) {
+          if (panel._timer) { clearTimeout(panel._timer); panel._timer = null; }
+          if (current) current.remove();
+          idx = i;
+          const it = items[i];
+          let media;
+          if (it.isVideo) {
+            media = document.createElement('video');
+            media.src = it.url;
+            media.muted = settings.volume === 0;
+            media.volume = settings.volume;
+            media.playbackRate = settings.rate;
+            media.autoplay = true;
+            media.playsInline = true;
+            media.addEventListener('ended', next);
+            media.play();
+          } else {
+            media = document.createElement('img');
+            media.src = it.url;
+            panel._timer = setTimeout(next, settings.interval * 1000);
+          }
+          current = media;
+          panel.insertBefore(media, controls);
+          enableZoomPan(panel, media);
+        }
+
+        const controls = buildMixedControls(
+          settings,
+          () => (current && current.tagName === 'VIDEO') ? current : null,
+          () => {
+            // 目前顯示的是圖片時，立刻用新間隔重新計時
+            if (current && current.tagName === 'IMG') {
+              clearTimeout(panel._timer);
+              panel._timer = setTimeout(next, settings.interval * 1000);
+            }
+          }
+        );
+        panel.appendChild(controls);
+        show(0);
+      } else {
+        // 單一檔案：圖片靜態顯示，影片循環播放
+        const f = mediaFiles[0];
+        const url = URL.createObjectURL(f);
+        panel._urls = [url];
+        let media, controls = null;
+
+        if (f.type.startsWith('video/')) {
+          media = document.createElement('video');
+          media.src = url;
+          media.loop = true;      // 循環播放
+          media.muted = true;     // 預設音量 0（靜音才能自動播放）
+          media.volume = 0;
+          media.autoplay = true;
+          media.playsInline = true;
+          media.play();
+          controls = buildControls(media);
+        } else {
+          media = document.createElement('img');
+          media.src = url;
+        }
+
+        panel.appendChild(media);
+        if (controls) panel.appendChild(controls);
+        enableZoomPan(panel, media);
+      }
     });
 
     container.appendChild(panel);
