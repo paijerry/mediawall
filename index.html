@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<title>七格媒體牆</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #111; }
+
+  .container {
+    display: flex;
+    width: 100vw;
+    height: 100vh;
+  }
+
+  .panel {
+    flex: 1 1 0;
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .panel .hint {
+    color: #555;
+    font-family: sans-serif;
+    font-size: 14px;
+    text-align: center;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .panel.dragover {
+    outline: 2px dashed #4da3ff;
+    outline-offset: -6px;
+    background: rgba(77, 163, 255, 0.08);
+  }
+
+  .panel img,
+  .panel video {
+    /* 尺寸由 JS 依原圖比例計算，初始蓋滿格子、超出部分被 panel 裁切，
+       拖曳時就能看到原圖被裁掉的區域 */
+    position: absolute;
+    left: 0;
+    top: 0;
+    max-width: none;
+    transform-origin: 0 0;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  .panel img.panning,
+  .panel video.panning { cursor: grabbing; }
+
+  /* 影片控制列：滑鼠移入該格才顯示 */
+  .controls {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 8px 10px;
+    background: rgba(0, 0, 0, 0.65);
+    color: #eee;
+    font-family: sans-serif;
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.2s;
+    z-index: 1;
+  }
+  .panel:hover .controls { opacity: 1; }
+  .controls label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .controls input[type="range"] {
+    flex: 1;
+    min-width: 0;
+  }
+  .controls .val {
+    width: 38px;
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+<div class="container" id="container"></div>
+
+<script>
+  const container = document.getElementById('container');
+
+  // 滾輪縮放（以游標為中心）＋拖曳平移，雙擊重置
+  function enableZoomPan(panel, media) {
+    let scale = 1, tx = 0, ty = 0;
+    let baseTx = 0, baseTy = 0;
+    let baseW = 0, baseH = 0;
+
+    // 限制位移範圍，媒體邊緣不能進到格子內（永遠滿版）
+    function clamp() {
+      const pw = panel.clientWidth, ph = panel.clientHeight;
+      tx = Math.min(0, Math.max(pw - baseW * scale, tx));
+      ty = Math.min(0, Math.max(ph - baseH * scale, ty));
+    }
+
+    function apply() {
+      clamp();
+      media.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+    }
+
+    // 依原圖比例把元素放大到剛好蓋滿格子並置中（外觀同 cover，但保留完整原圖）
+    function layout() {
+      const pw = panel.clientWidth, ph = panel.clientHeight;
+      const nw = media.naturalWidth || media.videoWidth;
+      const nh = media.naturalHeight || media.videoHeight;
+      if (!nw || !nh) return;
+      const cover = Math.max(pw / nw, ph / nh);
+      baseW = nw * cover;
+      baseH = nh * cover;
+      media.style.width = baseW + 'px';
+      media.style.height = baseH + 'px';
+      baseTx = (pw - baseW) / 2;
+      baseTy = (ph - baseH) / 2;
+      scale = 1; tx = baseTx; ty = baseTy;
+      apply();
+    }
+
+    if (media.tagName === 'IMG') {
+      if (media.complete && media.naturalWidth) layout();
+      else media.addEventListener('load', layout, { once: true });
+    } else {
+      if (media.videoWidth) layout();
+      else media.addEventListener('loadedmetadata', layout, { once: true });
+    }
+
+    const onWheel = e => {
+      e.preventDefault();
+      const rect = panel.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+
+      const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+      const newScale = Math.min(10, Math.max(1, scale * factor));
+
+      // 讓游標下的點在縮放前後保持不動
+      tx = px - (px - tx) * (newScale / scale);
+      ty = py - (py - ty) * (newScale / scale);
+      scale = newScale;
+
+      if (scale === 1) { tx = baseTx; ty = baseTy; } // 縮回原始大小時歸位置中
+      apply();
+    };
+    // 換新檔案時移除舊的滾輪監聽，避免累積
+    if (panel._onWheel) panel.removeEventListener('wheel', panel._onWheel);
+    panel._onWheel = onWheel;
+    panel.addEventListener('wheel', onWheel, { passive: false });
+
+    media.addEventListener('pointerdown', e => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      media.setPointerCapture(e.pointerId);
+      media.classList.add('panning');
+      let lastX = e.clientX, lastY = e.clientY;
+
+      const onMove = ev => {
+        tx += ev.clientX - lastX;
+        ty += ev.clientY - lastY;
+        lastX = ev.clientX;
+        lastY = ev.clientY;
+        apply();
+      };
+      const onUp = () => {
+        media.classList.remove('panning');
+        media.removeEventListener('pointermove', onMove);
+        media.removeEventListener('pointerup', onUp);
+        media.removeEventListener('pointercancel', onUp);
+      };
+      media.addEventListener('pointermove', onMove);
+      media.addEventListener('pointerup', onUp);
+      media.addEventListener('pointercancel', onUp);
+    });
+
+    media.addEventListener('dblclick', () => {
+      scale = 1; tx = baseTx; ty = baseTy;
+      apply();
+    });
+  }
+
+  // 建立影片的音量／播放速度控制列
+  function buildControls(video) {
+    const box = document.createElement('div');
+    box.className = 'controls';
+
+    // 音量 0–100，預設 0
+    const volLabel = document.createElement('label');
+    volLabel.textContent = '音量';
+    const vol = document.createElement('input');
+    vol.type = 'range';
+    vol.min = 0;
+    vol.max = 100;
+    vol.value = 0;
+    const volVal = document.createElement('span');
+    volVal.className = 'val';
+    volVal.textContent = '0%';
+    vol.addEventListener('input', () => {
+      const v = vol.value / 100;
+      video.volume = v;
+      video.muted = (v === 0); // 音量拉到 0 就回到靜音
+      volVal.textContent = vol.value + '%';
+    });
+    volLabel.append(vol, volVal);
+
+    // 播放速度 0.25x–3x，預設 1x
+    const spdLabel = document.createElement('label');
+    spdLabel.textContent = '速度';
+    const spd = document.createElement('input');
+    spd.type = 'range';
+    spd.min = 0.25;
+    spd.max = 3;
+    spd.step = 0.05;
+    spd.value = 1;
+    const spdVal = document.createElement('span');
+    spdVal.className = 'val';
+    spdVal.textContent = '1.00x';
+    spd.addEventListener('input', () => {
+      video.playbackRate = parseFloat(spd.value);
+      spdVal.textContent = parseFloat(spd.value).toFixed(2) + 'x';
+    });
+    spdLabel.append(spd, spdVal);
+
+    box.append(volLabel, spdLabel);
+    return box;
+  }
+
+  // 從網址參數讀取分割方式，預設 7 等分
+  // 直欄模式（預設）：
+  //   ?n=5          → 5 等分
+  //   ?n=1-2-1      → 分三份，寬度比例 1:2:1（即 1/4、1/2、1/4）
+  // 方格模式（m=1）：
+  //   ?m=1&n=2      → 2 欄 1 列（左右各半）
+  //   ?m=1&n=3-2    → 3 欄 2 列，共 6 格
+  const params = new URLSearchParams(location.search);
+  const raw = params.get('n') || '';
+  const gridMode = params.get('m') === '1';
+  let weights;
+
+  if (gridMode) {
+    const parts = raw.split('-').map(v => parseInt(v, 10));
+    let cols = parts[0], rows = parts.length > 1 ? parts[1] : 1;
+    if (!Number.isInteger(cols) || cols < 1) { cols = 7; rows = 1; }
+    if (!Number.isInteger(rows) || rows < 1) rows = 1;
+    container.style.display = 'grid';
+    container.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    container.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
+    weights = Array(cols * rows).fill(1);
+  } else if (raw.includes('-')) {
+    weights = raw.split('-').map(Number);
+    if (weights.some(w => !(w > 0))) weights = null; // 有無效值就退回預設
+  } else {
+    const count = parseInt(raw, 10);
+    weights = (Number.isInteger(count) && count >= 1) ? Array(count).fill(1) : null;
+  }
+  if (!weights) weights = Array(7).fill(1);
+
+  for (const weight of weights) {
+    const panel = document.createElement('div');
+    panel.className = 'panel';
+    if (!gridMode) panel.style.flexGrow = weight; // 依比例分配寬度
+    panel.innerHTML = '<div class="hint">拖入圖片<br>或影片</div>';
+
+    panel.addEventListener('dragover', e => {
+      e.preventDefault();
+      panel.classList.add('dragover');
+    });
+    panel.addEventListener('dragleave', () => panel.classList.remove('dragover'));
+
+    panel.addEventListener('drop', e => {
+      e.preventDefault();
+      panel.classList.remove('dragover');
+
+      const file = e.dataTransfer.files[0];
+      if (!file) return;
+
+      const url = URL.createObjectURL(file);
+      let media;
+      let controls = null;
+
+      if (file.type.startsWith('image/')) {
+        media = document.createElement('img');
+        media.src = url;
+      } else if (file.type.startsWith('video/')) {
+        media = document.createElement('video');
+        media.src = url;
+        media.loop = true;      // 循環播放
+        media.muted = true;     // 預設音量 0（靜音才能自動播放）
+        media.volume = 0;
+        media.autoplay = true;
+        media.playsInline = true;
+        media.play();
+        controls = buildControls(media);
+      } else {
+        URL.revokeObjectURL(url);
+        return;
+      }
+
+      // 釋放舊的 object URL，避免記憶體累積
+      const old = panel.querySelector('img, video');
+      if (old && old.src.startsWith('blob:')) URL.revokeObjectURL(old.src);
+
+      panel.innerHTML = '';
+      panel.appendChild(media);
+      if (controls) panel.appendChild(controls);
+      enableZoomPan(panel, media);
+    });
+
+    container.appendChild(panel);
+  }
+
+  // 防止拖放到面板外時瀏覽器直接開啟檔案
+  window.addEventListener('dragover', e => e.preventDefault());
+  window.addEventListener('drop', e => e.preventDefault());
+</script>
+</body>
+</html>
